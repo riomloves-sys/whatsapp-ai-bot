@@ -102,11 +102,11 @@ const app = express();
 app.use(express.json());
 
 // ─── Health Check ────────────────────────────────────────────────────────────
+// Render pings GET / to confirm the service is alive.
+// Must return HTTP 200 — plain text "Server running" is the standard response.
 app.get("/", (_req, res) => {
     log("info", "Health", "Health check ping received");
-    // Plain "OK" satisfies Render/Railway health check probes.
-    // JSON body is also included for browser readability.
-    res.status(200).json({ status: "ok", message: "WhatsApp AI Bot is running." });
+    res.status(200).send("Server running");
 });
 
 // ─── Webhook Endpoint ────────────────────────────────────────────────────────
