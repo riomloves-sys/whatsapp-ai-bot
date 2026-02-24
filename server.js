@@ -83,41 +83,96 @@ function log(level, tag, ...args) {
     }
 }
 
-// ─── In-Memory Rate Limiter ───────────────────────────────────────────────────
-// Tracks message count per phone number within a rolling time window.
-// Prevents spam and runaway OpenAI costs.
-const rateLimitStore = new Map(); // phone -> { count, windowStart }
-const RATE_MAX = parseInt(RATE_LIMIT_MAX, 10);
-const RATE_WINDOW = parseInt(RATE_LIMIT_WINDOW_MS, 10);
+// ─── Spam Protection Tracker ─────────────────────────────────────────────────
+// Tracks last reply timing and text to enforce strict interval and duplicate rules.
+// Also manages debouncing (queuing) for rapid-fire messages.
+const spamTracker = new Map(); // phone -> { lastReplyAt, lastReplyText, debounceTimer, messageQueue: [] }
+const SPAM_INTERVAL_MS = 60000; // 60 seconds strict between bot replies
+const DEBOUNCE_WAIT_MS = 4000;  // Wait 4s for user to stop typing
 
-function isRateLimited(phone) {
+/**
+ * Checks if the bot is allowed to reply based on the 60s interval rule.
+ * Also checks if the new AI reply is a duplicate of the last one.
+ */
+function isRateLimited(phone, newReplyText = null) {
+    const entry = spamTracker.get(phone);
+    if (!entry) return false;
+
+    const intentEntry = leadStore.get(phone);
+    const intent = intentEntry ? intentEntry.intent : "COLD";
+
+    // Dynamic interval: HOT leads get 5s (priority), others 60s
+    const currentInterval = intent === "HOT" ? 5000 : SPAM_INTERVAL_MS;
+
     const now = Date.now();
-    const entry = rateLimitStore.get(phone);
 
-    if (!entry || now - entry.windowStart > RATE_WINDOW) {
-        // First message or window expired — reset
-        rateLimitStore.set(phone, { count: 1, windowStart: now });
-        return false;
-    }
-
-    if (entry.count >= RATE_MAX) {
-        log("warn", "RateLimit", `${phone} exceeded ${RATE_MAX} messages / ${RATE_WINDOW / 1000}s window`);
+    // Rule: Dynamic interval between bot replies
+    if (now - entry.lastReplyAt < currentInterval) {
+        const remaining = Math.ceil((currentInterval - (now - entry.lastReplyAt)) / 1000);
+        log("info", "Spam", `${phone} - ${intent} interval rule active - ${remaining}s remaining`);
         return true;
     }
 
-    entry.count += 1;
+    // Rule: Do not repeat same message twice
+    if (newReplyText && entry.lastReplyText === newReplyText) {
+        log("info", "Spam", `${phone} - duplicate message detected - blocking`);
+        return true;
+    }
+
     return false;
+}
+
+/**
+ * Updates the tracker after a successful reply.
+ */
+function updateLastReply(phone, text) {
+    const entry = spamTracker.get(phone) || { messageQueue: [] };
+    entry.lastReplyAt = Date.now();
+    entry.lastReplyText = text;
+    spamTracker.set(phone, entry);
 }
 
 // ─── Conversation History (in-memory, per sender) ────────────────────────────
 const conversationHistory = new Map();
 const MAX_HISTORY = 20;
 
-// ─── SAFE MODE ────────────────────────────────────────────────────────────────
-// Tracker per phone: { userMsgCount, lastSenderWasUs }
-// lastSenderWasUs = true  → bot OR team replied last → suppress auto-reply
-//                  false → customer sent last message without reply
+// ─── SAFE MODE & Lead Persistence ─────────────────────────────────────────────
+// We store lead intent and message counts in memory.json so they survive restarts.
+const MEMORY_FILE = path.join(__dirname, "memory.json");
 const safeModeTracker = new Map();
+const leadStore = new Map(); // phone → { intent: "HOT"|"WARM"|"COLD", updatedAt }
+
+function saveMemory() {
+    try {
+        const data = {
+            safeMode: Object.fromEntries(safeModeTracker),
+            leads: Object.fromEntries(leadStore),
+        };
+        fs.writeFileSync(MEMORY_FILE, JSON.stringify(data, null, 2));
+    } catch (err) {
+        log("error", "Memory", "Failed to save memory.json:", err.message);
+    }
+}
+
+function loadMemory() {
+    try {
+        if (fs.existsSync(MEMORY_FILE)) {
+            const data = JSON.parse(fs.readFileSync(MEMORY_FILE, "utf-8"));
+            if (data.safeMode) {
+                Object.entries(data.safeMode).forEach(([k, v]) => safeModeTracker.set(k, v));
+            }
+            if (data.leads) {
+                Object.entries(data.leads).forEach(([k, v]) => leadStore.set(k, v));
+            }
+            log("info", "Memory", `Loaded ${safeModeTracker.size} users and ${leadStore.size} leads from memory.json`);
+        }
+    } catch (err) {
+        log("error", "Memory", "Failed to load memory.json:", err.message);
+    }
+}
+
+// Initial load at startup
+loadMemory();
 
 // Keywords that ALWAYS trigger an auto-reply (even after we replied last)
 const TRIGGER_KEYWORDS = [
@@ -163,6 +218,61 @@ function shouldAutoReply(phone, messageText) {
     return false;
 }
 
+// HOT — clear buying signals: ready to order / asking final details
+const HOT_KEYWORDS = [
+    // Order intent
+    "bhej do", "bhejdo", "kar do", "kardo", "bej do", "order", "confirm", "book",
+    "le loon", "le lunga", "le lenge", "lena hai", "chahiye", "de do",
+    // Payment signals
+    "payment", "pay", "upi", "gpay", "google pay", "phonepay", "phonepe",
+    "paytm", "account number", "account no", "number bhejo", "details bhejo",
+    // Delivery urgency
+    "kab milega", "kab ayega", "kitne din", "kab milegi", "kab tak",
+    "delivery time", "kab bhejoge", "jaldi chahiye", "urgent",
+    // Positive confirmation
+    "haan kar do", "ok kar do", "theek hai kar do", "done", "finalize",
+];
+
+// WARM — interested but not yet committed
+const WARM_KEYWORDS = [
+    // Inquiry
+    "price", "rate", "cost", "kitna", "kitne", "fees", "charges", "kitna hai",
+    "detail", "details", "info", "information", "bata do", "batao",
+    "assignment", "project", "solve", "solution", "help",
+    "sample", "demo", "example", "quality",
+    "kya hai", "kaise", "how", "what", "which",
+    // Greeting / first contact
+    "hello", "hi", "hey", "helo", "namaste", "hii", "heyy",
+];
+
+// Detects and stores lead intent for a phone number
+// Returns "HOT" | "WARM" | "COLD"
+function detectLeadIntent(phone, messageText) {
+    const text = messageText.toLowerCase();
+
+    // Check HOT first (higher priority)
+    const isHot = HOT_KEYWORDS.some((kw) => text.includes(kw));
+    const isWarm = WARM_KEYWORDS.some((kw) => text.includes(kw));
+
+    let intent;
+    if (isHot) intent = "HOT";
+    else if (isWarm) intent = "WARM";
+    else intent = "COLD";
+
+    // Only upgrade intent — never downgrade (HOT stays HOT)
+    const existing = leadStore.get(phone);
+    const RANK = { HOT: 3, WARM: 2, COLD: 1 };
+    if (!existing || RANK[intent] > RANK[existing.intent]) {
+        leadStore.set(phone, { intent, updatedAt: Date.now() });
+        saveMemory();
+        log("info", "Lead", `${phone} → intent: ${intent}`);
+    } else {
+        intent = existing.intent; // keep the higher intent
+    }
+
+    return intent;
+}
+
 // ─── Human Override Protection ────────────────────────────────────────────────────
 // When a team member manually replies to a customer, the bot stays silent
 // for HUMAN_OVERRIDE_MS milliseconds (default: 15 minutes).
@@ -193,12 +303,92 @@ function isHumanOverrideActive(phone) {
     return false;
 }
 
+// ─── Escalation & Closing System ──────────────────────────────────────────────
+// Triggered when: customer asks for discount, seems confused, or reaches
+// order-ready stage (address / payment submitted).
+// Bot sends a handoff message then stays silent (20 min for help, 24h for orders).
+const escalationStore = new Map(); // phone → { silencedUntil: timestamp }
+const ESCALATION_MS = 20 * 60 * 1000; // 20 minutes (for confusion/discount)
+const CLOSING_MS = 24 * 60 * 60 * 1000; // 24 hours (for orders — "stop" auto replies)
+
+const ESCALATION_MSG = "Main details note kar raha hu 🙂\nTeam abhi confirm karke aapko guide kar degi.";
+const CLOSING_MSG = "Perfect 🙂\nMain details note kar raha hu.\nTeam abhi payment aur dispatch guide kar degi.";
+
+// Keywords that trigger escalation
+const ESCALATION_DISCOUNT_KW = [
+    "discount", "kam karo", "thoda kam", "kam ho sakta", "aur kam",
+    "cheaper", "reduce", "negotiate", "less price", "extra discount",
+    "chhod do", "maaf karo", "free karo", "free kar do",
+];
+const ESCALATION_CONFUSION_KW = [
+    "samajh nahi", "samajh nahi aaya", "kya matlab", "nahi samjha",
+    "confused", "confuse", "what do you mean", "don't understand",
+    "pata nahi", "mujhe nahi pata", "clear nahi", "ye kya hai",
+];
+const ESCALATION_ORDER_KW = [
+    // Address / contact submitted — order is ready to process
+    "pin code", "pincode", "near", "opposite", "mohalla", "gali",
+    "village", "ward no", "plot no", "house no", "flat no",
+    // Payment done
+    "kar diya", "kar diya payment", "paid", "payment ho gaya",
+    "bhej diya", "screenshot bhej", "transfer kar diya", "payment kar di",
+];
+
+/**
+ * Checks for triggers and sets the bot to silent mode.
+ * Returns the specific message to be sent, or null if no trigger hit.
+ */
+function checkAndSetEscalation(phone, messageText) {
+    const text = messageText.toLowerCase();
+
+    // Check for Order Confirmation (High Priority)
+    const orderHit = ESCALATION_ORDER_KW.some((kw) => text.includes(kw));
+    if (orderHit) {
+        const silencedUntil = Date.now() + CLOSING_MS;
+        escalationStore.set(phone, { silencedUntil });
+        log("info", "Closing", `ORDER CONFIRMED for ${phone} — bot stopped (24h)`);
+        return CLOSING_MSG;
+    }
+
+    // Check for general Escalation (Discount/Confusion)
+    const escalationHit =
+        ESCALATION_DISCOUNT_KW.some((kw) => text.includes(kw)) ||
+        ESCALATION_CONFUSION_KW.some((kw) => text.includes(kw));
+
+    if (escalationHit) {
+        const silencedUntil = Date.now() + ESCALATION_MS;
+        escalationStore.set(phone, { silencedUntil });
+        log("info", "Escalation", `ESCALATED for ${phone} — bot silent (20 min)`);
+        return ESCALATION_MSG;
+    }
+
+    return null;
+}
+
+// Returns true if escalation silence is still active
+function isEscalationActive(phone) {
+    const entry = escalationStore.get(phone);
+    if (!entry) return false;
+    if (Date.now() < entry.silencedUntil) {
+        const remaining = Math.ceil((entry.silencedUntil - Date.now()) / 1000 / 60);
+        log("info", "Escalation", `${phone} — escalation ACTIVE (${remaining} min remaining)`);
+        return true;
+    }
+    escalationStore.delete(phone);
+    log("info", "Escalation", `${phone} — escalation EXPIRED — bot resumed`);
+    return false;
+}
+
 // ─── Follow-Up System ──────────────────────────────────────────────────────────────
-// If a customer sends a message and no HUMAN replies within 10 minutes,
-// the bot sends ONE short info reply using knowledge.json.
-// Only one follow-up per conversation lifetime (followUpSent flag).
-const followUpStore = new Map(); // phone → { timerId, followUpSent }
-const FOLLOWUP_DELAY_MS = 10 * 60 * 1000; // 10 minutes
+// If a customer stops replying, we send up to 2 nudges:
+// 1. After 30 minutes
+// 2. After 6 hours
+const followUpStore = new Map(); // phone → { timerId, count }
+const FOLLOWUP_T1_MS = 30 * 60 * 1000; // 30 minutes
+const FOLLOWUP_T2_MS = 6 * 60 * 60 * 1000; // 6 hours
+
+const FOLLOWUP_MSG_1 = "Aapko assignment chahiye tha na 🙂\nCourse bata do to main exact guide kar du.";
+const FOLLOWUP_MSG_2 = "Aaj kaam karwa denge to submission tension khatam 🙂\nBata do help chahiye?";
 
 // Builds a short, WhatsApp-friendly follow-up message from KB
 function buildFollowUpMessage() {
@@ -214,45 +404,50 @@ function buildFollowUpMessage() {
     );
 }
 
-// Schedule a follow-up for this phone (resets timer if already pending)
-function scheduleFollowUp(phone, senderJid) {
-    const existing = followUpStore.get(phone) || { timerId: null, followUpSent: false };
+// Schedule a follow-up (resets cycle on any interaction)
+function scheduleFollowUp(phone, senderJid, stage = 1) {
+    let entry = followUpStore.get(phone);
+    if (!entry) {
+        entry = { timerId: null, count: 0 };
+        followUpStore.set(phone, entry);
+    }
 
-    // Only one follow-up per conversation lifetime
-    if (existing.followUpSent) {
-        log("info", "FollowUp", `${phone} — follow-up already sent, skipping schedule`);
+    // Cancel any existing timer
+    if (entry.timerId) {
+        clearTimeout(entry.timerId);
+        entry.timerId = null;
+    }
+
+    // If stage is 1, it means a fresh interaction happened — reset count
+    if (stage === 1) {
+        entry.count = 0;
+    }
+
+    // Don't follow up if we already sent 2 or if human override is active
+    if (entry.count >= 2 || isHumanOverrideActive(phone)) {
         return;
     }
 
-    // Cancel any pending timer before setting a new one
-    if (existing.timerId) {
-        clearTimeout(existing.timerId);
-        log("info", "FollowUp", `${phone} — existing follow-up timer reset`);
-    }
+    const delay = stage === 1 ? FOLLOWUP_T1_MS : (FOLLOWUP_T2_MS - FOLLOWUP_T1_MS);
+    const msg = stage === 1 ? FOLLOWUP_MSG_1 : FOLLOWUP_MSG_2;
 
-    const timerId = setTimeout(async () => {
-        const entry = followUpStore.get(phone);
-        if (!entry || entry.followUpSent) return; // already sent or cancelled
-
-        // Don't send if team took over during the wait
-        if (isHumanOverrideActive(phone)) {
-            log("info", "FollowUp", `${phone} — human override active, follow-up SKIPPED`);
-            return;
-        }
-
-        log("info", "FollowUp", `${phone} — 10 min elapsed, no human reply — sending follow-up`);
-        const msg = buildFollowUpMessage();
+    entry.timerId = setTimeout(async () => {
         try {
-            await sendWhatsAppMessage(senderJid, msg);
-            entry.followUpSent = true; // mark as sent — never send again
-            log("info", "FollowUp", `${phone} — follow-up delivered ✓`);
-        } catch (err) {
-            log("error", "FollowUp", `${phone} — failed to send follow-up:`, err.message);
-        }
-    }, FOLLOWUP_DELAY_MS);
+            // Check if user replied in the meantime or override activated
+            if (isHumanOverrideActive(phone)) return;
 
-    followUpStore.set(phone, { timerId, followUpSent: false });
-    log("info", "FollowUp", `${phone} — follow-up scheduled in ${FOLLOWUP_DELAY_MS / 60000} min`);
+            await sendWhatsAppMessage(senderJid, msg);
+            entry.count++;
+            log("info", "FollowUp", `${phone} — Sent Stage ${entry.count} nudge`);
+
+            // If we just sent Stage 1, schedule Stage 2
+            if (entry.count === 1) {
+                scheduleFollowUp(phone, senderJid, 2);
+            }
+        } catch (err) {
+            log("error", "FollowUp", `${phone} — failed to nudge:`, err.message);
+        }
+    }, delay);
 }
 
 // Cancel a pending follow-up (called when team manually replies)
@@ -260,8 +455,8 @@ function cancelFollowUp(phone) {
     const entry = followUpStore.get(phone);
     if (entry?.timerId) {
         clearTimeout(entry.timerId);
-        followUpStore.set(phone, { timerId: null, followUpSent: entry.followUpSent });
-        log("info", "FollowUp", `${phone} — follow-up timer CANCELLED (team replied)`);
+        entry.timerId = null;
+        log("info", "FollowUp", `${phone} — follow-up timer PAUSED (team/human active)`);
     }
 }
 
@@ -297,6 +492,15 @@ app.get("/", (_req, res) => {
  *   ]
  * }
  */
+app.get("/webhook", (req, res) => {
+    const challenge = req.query.challenge || req.query["hub.challenge"];
+    if (challenge) {
+        log("info", "Webhook", "Verification challenge received and returned");
+        return res.status(200).send(challenge);
+    }
+    res.status(403).send("No challenge provided");
+});
+
 app.post("/webhook", (req, res) => {
     // ✅ Respond 200 immediately — never block Whapi waiting for AI
     res.sendStatus(200);
@@ -332,12 +536,13 @@ async function handleMessage(message) {
             const tracker = safeModeTracker.get(customerPhone) || { userMsgCount: 0, lastSenderWasUs: false };
             tracker.lastSenderWasUs = true;
             safeModeTracker.set(customerPhone, tracker);
+            saveMemory();
 
             // Set HUMAN OVERRIDE — bot silent for 15 minutes
             setHumanOverride(customerPhone);
 
-            // Cancel follow-up timer — team is handling this chat
-            cancelFollowUp(customerPhone);
+            // Schedule follow-up — if user doesn't reply to team, bot will nudge
+            scheduleFollowUp(customerPhone, customerJid);
         }
         return;
     }
@@ -365,91 +570,147 @@ async function handleMessage(message) {
     const senderPhone = senderJid.split("@")[0];
     log("info", "Handler", `Message from ${senderPhone}: "${messageText}"`);
 
-    // Schedule follow-up: if no human replies in 10 min, bot sends one info message
-    // This runs regardless of whether bot auto-replies below
+    // ── Spam Protection: Debouncing ──────────────────────────────────────────
+    // If user sends many messages quickly, we wait 4s after the LAST one before replying.
+    let entry = spamTracker.get(senderPhone);
+    if (!entry) {
+        entry = { lastReplyAt: 0, lastReplyText: "", debounceTimer: null, messageQueue: [] };
+        spamTracker.set(senderPhone, entry);
+    }
+
+    // Accumulate the message
+    entry.messageQueue.push(messageText);
+
+    // Reset the debounce timer
+    if (entry.debounceTimer) clearTimeout(entry.debounceTimer);
+
+    entry.debounceTimer = setTimeout(async () => {
+        // Core logic now runs inside the debounce callback
+        try {
+            await executeMainLogic(senderPhone, senderJid);
+        } catch (err) {
+            log("error", "Spam", `Error in debounced processing for ${senderPhone}:`, err.message);
+        }
+    }, DEBOUNCE_WAIT_MS);
+}
+
+/**
+ * The actual intelligence logic, executed after debouncing multiple messages.
+ */
+async function executeMainLogic(senderPhone, senderJid) {
+    const entry = spamTracker.get(senderPhone);
+    if (!entry || entry.messageQueue.length === 0) return;
+
+    // Join all messages sent during the debounce window
+    const combinedText = entry.messageQueue.join(" ");
+    entry.messageQueue = []; // Clear for next round
+
+    log("info", "Spam", `${senderPhone} - processing combined text: "${combinedText}"`);
+
+    // Schedule follow-up
     scheduleFollowUp(senderPhone, senderJid);
 
-    // ── Guard 4: Human Override check (team replied → 15 min silence) ──────────
-    if (isHumanOverrideActive(senderPhone)) {
-        return;
-    }
+    // ── Guard 4: Human Override check
+    if (isHumanOverrideActive(senderPhone)) return;
 
-    // ── Guard 5: SAFE MODE keyword/first-message check ────────────────────────
-    if (!shouldAutoReply(senderPhone, messageText)) {
-        return;
-    }
+    // ── Guard 4.5: Escalation Active check
+    if (isEscalationActive(senderPhone)) return;
 
-    // ── Guard 6: Rate limit check ─────────────────────────────────────────────
+    // ── Guard 5: SAFE MODE
+    if (!shouldAutoReply(senderPhone, combinedText)) return;
+
+    // ── Guard 6: Interval rule (Once per 60s)
     if (isRateLimited(senderPhone)) {
-        log("warn", "Handler", `Rate limit hit for ${senderPhone} — no reply sent`);
+        log("warn", "Spam", `${senderPhone} - interval rule blocked the reply`);
         return;
     }
 
-    // ── Build / retrieve conversation history ─────────────────────────────────
-    if (!conversationHistory.has(senderPhone)) {
+    // ── Build / retrieve conversation history
+    const isNewSession = !conversationHistory.has(senderPhone);
+    const hasPastHistory = safeModeTracker.has(senderPhone);
+    const restartingContext = isNewSession && hasPastHistory;
+
+    if (isNewSession) {
         conversationHistory.set(senderPhone, []);
-        log("info", "Handler", `New conversation started for ${senderPhone}`);
     }
     const history = conversationHistory.get(senderPhone);
 
-    // Append incoming user message + increment safe mode counter
-    history.push({ role: "user", content: messageText });
+    // Append combined user message + increment safe mode counter
+    history.push({ role: "user", content: combinedText });
     const smTracker = safeModeTracker.get(senderPhone) || { userMsgCount: 0, lastSenderWasUs: false };
     smTracker.userMsgCount += 1;
     smTracker.lastSenderWasUs = false;
     safeModeTracker.set(senderPhone, smTracker);
-    log("info", "Handler", `History length for ${senderPhone}: ${history.length} | SafeMode msgCount: ${smTracker.userMsgCount}`);
+    saveMemory();
 
-    // ── Step 1: Get AI reply ──────────────────────────────────────────────────
+    // Detect intent
+    const leadIntent = detectLeadIntent(senderPhone, combinedText);
+
+    // ── Escalation/Closing trigger (discount / confusion / order-ready) ──────
+    const handoffMsg = checkAndSetEscalation(senderPhone, combinedText);
+    if (handoffMsg) {
+        try {
+            await sendWhatsAppMessage(senderJid, handoffMsg);
+            updateLastReply(senderPhone, handoffMsg);
+            log("info", "Handoff", `Handoff/Closing message sent to ${senderPhone}`);
+        } catch (err) {
+            log("error", "Handoff", `Failed to send handoff message to ${senderPhone}:`, err.message);
+        }
+        return; // do NOT call OpenAI
+    }
+
+    // ── Step 1: Get AI reply
     let aiReply;
     try {
-        log("info", "OpenAI", `Sending request for ${senderPhone} (model: ${OPENAI_MODEL})`);
-        aiReply = await getOpenAIReply(history);
+        log("info", "OpenAI", `Sending request for ${senderPhone} (HOT/WARM/COLD: ${leadIntent}${restartingContext ? " | RESTARTING" : ""})`);
+        aiReply = await getOpenAIReply(history, leadIntent, restartingContext);
+
+        // EXTRA RULE: Do not repeat same message twice
+        if (isRateLimited(senderPhone, aiReply)) {
+            log("info", "Spam", `${senderPhone} - blocked duplicate AI reply`);
+            return;
+        }
+
         log("info", "OpenAI", `Reply for ${senderPhone}: "${aiReply}"`);
     } catch (err) {
         log("error", "OpenAI", `Request failed for ${senderPhone}:`, err.message);
-        if (err.response) {
-            log("error", "OpenAI", `Status: ${err.response.status}`, JSON.stringify(err.response.data));
-        }
-        // Remove the user message we just pushed so history stays clean
         history.pop();
         return;
     }
 
-    // Persist assistant reply in history + mark "we replied last" in safe mode
+    // Persist assistant reply
     history.push({ role: "assistant", content: aiReply });
     const smTracker2 = safeModeTracker.get(senderPhone) || { userMsgCount: 0, lastSenderWasUs: false };
     smTracker2.lastSenderWasUs = true;
     safeModeTracker.set(senderPhone, smTracker2);
 
-    // Trim to last MAX_HISTORY turn-pairs
+    // Trim history
     if (history.length > MAX_HISTORY * 2) {
         history.splice(0, history.length - MAX_HISTORY * 2);
-        log("info", "Handler", `Trimmed history for ${senderPhone} to ${MAX_HISTORY * 2} messages`);
     }
 
-    // ── Step 2: Send reply via Whapi ──────────────────────────────────────────
+    // ── Step 2: Send reply via Whapi
     try {
-        log("info", "Whapi", `Sending reply to ${senderPhone}`);
         await sendWhatsAppMessage(senderJid, aiReply);
+        updateLastReply(senderPhone, aiReply); // Track last sent
         log("info", "Whapi", `Reply delivered to ${senderPhone} ✓`);
     } catch (err) {
         log("error", "Whapi", `Failed to send message to ${senderPhone}:`, err.message);
-        if (err.response) {
-            log("error", "Whapi", `Status: ${err.response.status}`, JSON.stringify(err.response.data));
-        }
     }
 }
 
 // ─── OpenAI Integration ──────────────────────────────────────────────────────
 // history: { role: "user"|"assistant", content: string }[]
-async function getOpenAIReply(history) {
+// intent:  "HOT" | "WARM" | "COLD"
+async function getOpenAIReply(history, intent = "WARM", restarting = false) {
     // ── Build system prompt dynamically from knowledge.json ──────────────────
     const K = KB;  // shorthand
     const systemPrompt = {
         role: "system",
         content: `Tu ${K.business?.assistant_name ?? "Priya"} hai — *${K.business?.name ?? "Guru Nanak Photostate"}*, ${K.business?.location ?? "Fatehabad, Haryana"} ki WhatsApp sales assistant.
 Tu ek real human ki tarah baat karta hai — koi AI vibe nahi, sirf natural Hinglish conversation.
+
+${restarting ? "## RESTART SAFETY:\nUser se pehle baat hui thi par long break ke baad message aaya hai. Pehle line mein yeh politeness context check zaroor bolo: 'Last time aap assignment ke bare me pooch rahe the na? 🙂'\n\n" : ""}
 
 ## LANGUAGE MIRRORING — sabse important rule:
 - Customer Hindi/Hinglish mein likhe → tu bhi Hinglish mein reply kar
@@ -532,7 +793,35 @@ Aap preferred time bata do."
 6. Koi bhi price, course ya detail ke baare mein unsure ho → SIRF yeh bol:
    "Iske exact details ke liye team call karke guide kar degi 🙂 Aap preferred time bata do."
    NEVER guess. NEVER invent.
-7. Topic se bhatak jaaye → "Main IGNOU assignments ke liye hoon 😊 Kaunsa course chahiye?"`
+7. Topic se bhatak jaaye → "Main IGNOU assignments ke liye hoon 😊 Kaunsa course chahiye?"
+
+## 🔥 CURRENT LEAD STATUS: ${intent}
+${intent === "HOT"
+                ? "CUSTOMER HOT LEAD HAI — order confirmation flow shuru karo.\n" +
+                "Conversation history dekho aur sirf NEXT missing info poochho — ek baar mein sirf EK cheez:\n\n" +
+                "STEP A: COURSE + SUBJECT confirm hai?\n" +
+                "  → Nahi: 'Konsa course aur subject hai? 😊'\n\n" +
+                "STEP B: HANDWRITTEN ya PDF?\n" +
+                "  → Nahi: 'Handwritten chahiye ya PDF? 📄'\n\n" +
+                "STEP C: DELIVERY confirm?\n" +
+                "  → Handwritten: 'Courier se bhejenge — address chahiye 😊'\n" +
+                "  → PDF: 'WhatsApp pe turant bhej denge ✅'\n\n" +
+                "STEP D: CONTACT INFO:\n" +
+                "  → Handwritten: 'Poora delivery address bata do 😊'\n" +
+                "  → PDF: 'Bas naam confirm karo!'\n\n" +
+                "STEP E: SAB DONE? Payment bhejo:\n" +
+                "  → 'Perfect! UPI details bhej rahi hoon — abhi kar do 😊'\n\n" +
+                "RULES: Jo already confirm hai woh mat poochho. Ek message = ek question only. Max 2 lines."
+                : intent === "WARM"
+                    ? "CUSTOMER INTERESTED HAI — conversation chalu rakho aur sawaal poochho:\n" +
+                    "→ Course/type missing hai to poocho\n" +
+                    "→ Price batao specifically unke liye\n" +
+                    "→ Goal: Inhe HOT lead banana hai sawaal pooch kar"
+                    : "CUSTOMER COLD HAI — sirf initial greeting bhej ke ruk jao:\n" +
+                    "→ Agar first message hai: Simple greeting do\n" +
+                    "→ Uske baad: Zyada effort mat lagao, wait karo\n" +
+                    "→ Jab tak keyword na mile, deep sales pitch mat karo"
+            }`,
     };
 
     const response = await axios.post(
