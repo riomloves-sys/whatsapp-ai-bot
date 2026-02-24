@@ -867,5 +867,6 @@ app.listen(PORT, () => {
     log("info", "Server", `WhatsApp AI Bot listening on port ${PORT} `);
     log("info", "Server", `Webhook URL: http://localhost:${PORT}/webhook`);
     log("info", "Server", `OpenAI Model: ${OPENAI_MODEL}`);
-    log("info", "Server", `Rate limit: ${RATE_MAX} messages per ${RATE_WINDOW / 1000}s per user`);
+    log("info", "Server", `Anti-Spam: ${SPAM_INTERVAL_MS / 1000}s interval rule active`);
+    log("info", "Server", `Persistence: memory.json enabled`);
 });
