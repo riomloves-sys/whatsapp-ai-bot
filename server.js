@@ -104,7 +104,9 @@ app.use(express.json());
 // ─── Health Check ────────────────────────────────────────────────────────────
 app.get("/", (_req, res) => {
     log("info", "Health", "Health check ping received");
-    res.json({ status: "ok", message: "WhatsApp AI Bot is running." });
+    // Plain "OK" satisfies Render/Railway health check probes.
+    // JSON body is also included for browser readability.
+    res.status(200).json({ status: "ok", message: "WhatsApp AI Bot is running." });
 });
 
 // ─── Webhook Endpoint ────────────────────────────────────────────────────────
