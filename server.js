@@ -36,21 +36,25 @@ const axios = require("axios");
 // ─── Env Validation ──────────────────────────────────────────────────────────
 const {
     PORT = 3000,
-    OPENAI_API_KEY,
+    OPENAI_KEY,          // Render env var name
     OPENAI_MODEL = "gpt-4o-mini",
-    WHAPI_API_KEY,
+    WHATAPI_TOKEN,       // Render env var name
     WHAPI_API_URL = "https://gate.whapi.cloud",
-    RATE_LIMIT_MAX = "5",          // max messages per window per user
-    RATE_LIMIT_WINDOW_MS = "60000", // window size in ms (default: 1 minute)
+    RATE_LIMIT_MAX = "5",
+    RATE_LIMIT_WINDOW_MS = "60000",
 } = process.env;
 
+// Internal aliases — rest of code uses these
+const OPENAI_API_KEY = OPENAI_KEY;
+const WHAPI_API_KEY = WHATAPI_TOKEN;
+
 if (!OPENAI_API_KEY) {
-    console.error("[FATAL] OPENAI_API_KEY is not set in environment variables.");
+    console.error("[FATAL] OPENAI_KEY is not set in Render environment variables.");
     process.exit(1);
 }
 
 if (!WHAPI_API_KEY) {
-    console.error("[FATAL] WHAPI_API_KEY is not set in environment variables.");
+    console.error("[FATAL] WHATAPI_TOKEN is not set in Render environment variables.");
     process.exit(1);
 }
 
