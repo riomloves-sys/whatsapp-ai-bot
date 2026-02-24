@@ -32,6 +32,20 @@
 require("dotenv").config();
 const express = require("express");
 const axios = require("axios");
+const fs = require("fs");
+const path = require("path");
+
+// ─── Knowledge Base Loader ────────────────────────────────────────────────────
+// knowledge.json is loaded ONCE at startup.
+// To update bot behaviour, edit knowledge.json and restart the server.
+let KB = {};
+try {
+    const kbPath = path.join(__dirname, "knowledge.json");
+    KB = JSON.parse(fs.readFileSync(kbPath, "utf-8"));
+    console.log("[Knowledge] knowledge.json loaded successfully ✓");
+} catch (err) {
+    console.warn("[Knowledge] WARNING: knowledge.json not found or invalid — using empty KB:", err.message);
+}
 
 // ─── Env Validation ──────────────────────────────────────────────────────────
 const {
@@ -96,10 +110,160 @@ function isRateLimited(phone) {
 }
 
 // ─── Conversation History (in-memory, per sender) ────────────────────────────
-// Stores { role, content }[] keyed by phone number.
-// Trimmed to MAX_HISTORY turn-pairs to keep token usage bounded.
 const conversationHistory = new Map();
 const MAX_HISTORY = 20;
+
+// ─── SAFE MODE ────────────────────────────────────────────────────────────────
+// Tracker per phone: { userMsgCount, lastSenderWasUs }
+// lastSenderWasUs = true  → bot OR team replied last → suppress auto-reply
+//                  false → customer sent last message without reply
+const safeModeTracker = new Map();
+
+// Keywords that ALWAYS trigger an auto-reply (even after we replied last)
+const TRIGGER_KEYWORDS = [
+    "price", "rate", "cost", "fees", "charges", "kitna", "kitne",
+    "assignment", "project", "solve", "solution", "solved",
+    "detail", "details", "info", "information",
+    "sample", "demo", "example",
+    "delivery", "time", "kab", "when",
+    "payment", "pay", "upi", "gpay",
+    "order", "confirm", "book",
+];
+
+// Returns true if the bot should auto-reply in SAFE MODE
+function shouldAutoReply(phone, messageText) {
+    const tracker = safeModeTracker.get(phone) || { userMsgCount: 0, lastSenderWasUs: false };
+    const text = messageText.toLowerCase();
+
+    // Rule 1: ALWAYS reply to the very first message
+    if (tracker.userMsgCount === 0) {
+        log("info", "SafeMode", `${phone} → first message — auto-reply ALLOWED`);
+        return true;
+    }
+
+    // Rule 3: If our team/bot replied last, only continue if keyword matched
+    if (tracker.lastSenderWasUs) {
+        const matched = TRIGGER_KEYWORDS.find((kw) => text.includes(kw));
+        if (!matched) {
+            log("info", "SafeMode", `${phone} → team replied last + no keyword — SUPPRESSED`);
+            return false;
+        }
+        log("info", "SafeMode", `${phone} → keyword "${matched}" matched — auto-reply ALLOWED`);
+        return true;
+    }
+
+    // Rule 2: Customer sent last (no reply yet) + keyword triggered
+    const matched = TRIGGER_KEYWORDS.find((kw) => text.includes(kw));
+    if (matched) {
+        log("info", "SafeMode", `${phone} → keyword "${matched}" — auto-reply ALLOWED`);
+        return true;
+    }
+
+    log("info", "SafeMode", `${phone} → no keyword match — SUPPRESSED`);
+    return false;
+}
+
+// ─── Human Override Protection ────────────────────────────────────────────────────
+// When a team member manually replies to a customer, the bot stays silent
+// for HUMAN_OVERRIDE_MS milliseconds (default: 15 minutes).
+// This prevents the bot from interrupting an ongoing human conversation.
+const humanOverrideStore = new Map(); // phone → { silencedUntil: timestamp }
+const HUMAN_OVERRIDE_MS = 15 * 60 * 1000; // 15 minutes in ms
+
+// Set override: bot will be silent for this phone for 15 minutes
+function setHumanOverride(phone) {
+    const silencedUntil = Date.now() + HUMAN_OVERRIDE_MS;
+    humanOverrideStore.set(phone, { silencedUntil });
+    const expiresAt = new Date(silencedUntil).toISOString();
+    log("info", "Override", `Human override SET for ${phone} — bot silent until ${expiresAt}`);
+}
+
+// Returns true if override is still active (within cooldown window)
+function isHumanOverrideActive(phone) {
+    const entry = humanOverrideStore.get(phone);
+    if (!entry) return false;
+    if (Date.now() < entry.silencedUntil) {
+        const remaining = Math.ceil((entry.silencedUntil - Date.now()) / 1000 / 60);
+        log("info", "Override", `${phone} — human override ACTIVE (${remaining} min remaining) — bot SUPPRESSED`);
+        return true;
+    }
+    // Override expired — clean up
+    humanOverrideStore.delete(phone);
+    log("info", "Override", `${phone} — human override EXPIRED — bot resumed`);
+    return false;
+}
+
+// ─── Follow-Up System ──────────────────────────────────────────────────────────────
+// If a customer sends a message and no HUMAN replies within 10 minutes,
+// the bot sends ONE short info reply using knowledge.json.
+// Only one follow-up per conversation lifetime (followUpSent flag).
+const followUpStore = new Map(); // phone → { timerId, followUpSent }
+const FOLLOWUP_DELAY_MS = 10 * 60 * 1000; // 10 minutes
+
+// Builds a short, WhatsApp-friendly follow-up message from KB
+function buildFollowUpMessage() {
+    const K = KB;
+    const name = K.project_info?.assistant_name ?? "Priya";
+    const hwPrice = K.price_info?.handwritten?.per_assignment ?? "₹100–₹150";
+    const pdfPrice = K.price_info?.typed_pdf?.per_assignment ?? "₹80–₹120";
+    const delivery = K.delivery_info?.standard ?? "24–48 hrs after payment";
+    return (
+        `Hi! 👋 Still here to help with your IGNOU assignments.\n` +
+        `Handwritten: ${hwPrice} | PDF: ${pdfPrice} | Delivery: ${delivery} ⏱️\n` +
+        `Just reply with your course name to get started! 📚`
+    );
+}
+
+// Schedule a follow-up for this phone (resets timer if already pending)
+function scheduleFollowUp(phone, senderJid) {
+    const existing = followUpStore.get(phone) || { timerId: null, followUpSent: false };
+
+    // Only one follow-up per conversation lifetime
+    if (existing.followUpSent) {
+        log("info", "FollowUp", `${phone} — follow-up already sent, skipping schedule`);
+        return;
+    }
+
+    // Cancel any pending timer before setting a new one
+    if (existing.timerId) {
+        clearTimeout(existing.timerId);
+        log("info", "FollowUp", `${phone} — existing follow-up timer reset`);
+    }
+
+    const timerId = setTimeout(async () => {
+        const entry = followUpStore.get(phone);
+        if (!entry || entry.followUpSent) return; // already sent or cancelled
+
+        // Don't send if team took over during the wait
+        if (isHumanOverrideActive(phone)) {
+            log("info", "FollowUp", `${phone} — human override active, follow-up SKIPPED`);
+            return;
+        }
+
+        log("info", "FollowUp", `${phone} — 10 min elapsed, no human reply — sending follow-up`);
+        const msg = buildFollowUpMessage();
+        try {
+            await sendWhatsAppMessage(senderJid, msg);
+            entry.followUpSent = true; // mark as sent — never send again
+            log("info", "FollowUp", `${phone} — follow-up delivered ✓`);
+        } catch (err) {
+            log("error", "FollowUp", `${phone} — failed to send follow-up:`, err.message);
+        }
+    }, FOLLOWUP_DELAY_MS);
+
+    followUpStore.set(phone, { timerId, followUpSent: false });
+    log("info", "FollowUp", `${phone} — follow-up scheduled in ${FOLLOWUP_DELAY_MS / 60000} min`);
+}
+
+// Cancel a pending follow-up (called when team manually replies)
+function cancelFollowUp(phone) {
+    const entry = followUpStore.get(phone);
+    if (entry?.timerId) {
+        clearTimeout(entry.timerId);
+        followUpStore.set(phone, { timerId: null, followUpSent: entry.followUpSent });
+        log("info", "FollowUp", `${phone} — follow-up timer CANCELLED (team replied)`);
+    }
+}
 
 // ─── Express Setup ───────────────────────────────────────────────────────────
 const app = express();
@@ -156,9 +320,25 @@ app.post("/webhook", (req, res) => {
 
 // ─── Core Message Handler ────────────────────────────────────────────────────
 async function handleMessage(message) {
-    // ── Guard 1: Ignore own messages ─────────────────────────────────────────
+    // ── Guard 1: Track team's manual outgoing messages (from_me) ─────────────
+    // When our team manually replies on WhatsApp, Whapi sends a from_me=true
+    // event. We record this so SAFE MODE knows the team is handling that chat.
     if (message.from_me === true) {
-        log("info", "Handler", "Skipping own outgoing message");
+        // 'to' field holds the customer's JID on outgoing messages
+        const customerJid = message.to || "";
+        const customerPhone = customerJid.split("@")[0];
+        if (customerPhone) {
+            // Update SAFE MODE tracker
+            const tracker = safeModeTracker.get(customerPhone) || { userMsgCount: 0, lastSenderWasUs: false };
+            tracker.lastSenderWasUs = true;
+            safeModeTracker.set(customerPhone, tracker);
+
+            // Set HUMAN OVERRIDE — bot silent for 15 minutes
+            setHumanOverride(customerPhone);
+
+            // Cancel follow-up timer — team is handling this chat
+            cancelFollowUp(customerPhone);
+        }
         return;
     }
 
@@ -185,7 +365,21 @@ async function handleMessage(message) {
     const senderPhone = senderJid.split("@")[0];
     log("info", "Handler", `Message from ${senderPhone}: "${messageText}"`);
 
-    // ── Guard 4: Rate limit check ─────────────────────────────────────────────
+    // Schedule follow-up: if no human replies in 10 min, bot sends one info message
+    // This runs regardless of whether bot auto-replies below
+    scheduleFollowUp(senderPhone, senderJid);
+
+    // ── Guard 4: Human Override check (team replied → 15 min silence) ──────────
+    if (isHumanOverrideActive(senderPhone)) {
+        return;
+    }
+
+    // ── Guard 5: SAFE MODE keyword/first-message check ────────────────────────
+    if (!shouldAutoReply(senderPhone, messageText)) {
+        return;
+    }
+
+    // ── Guard 6: Rate limit check ─────────────────────────────────────────────
     if (isRateLimited(senderPhone)) {
         log("warn", "Handler", `Rate limit hit for ${senderPhone} — no reply sent`);
         return;
@@ -198,9 +392,13 @@ async function handleMessage(message) {
     }
     const history = conversationHistory.get(senderPhone);
 
-    // Append incoming user message
+    // Append incoming user message + increment safe mode counter
     history.push({ role: "user", content: messageText });
-    log("info", "Handler", `History length for ${senderPhone}: ${history.length} messages`);
+    const smTracker = safeModeTracker.get(senderPhone) || { userMsgCount: 0, lastSenderWasUs: false };
+    smTracker.userMsgCount += 1;
+    smTracker.lastSenderWasUs = false;
+    safeModeTracker.set(senderPhone, smTracker);
+    log("info", "Handler", `History length for ${senderPhone}: ${history.length} | SafeMode msgCount: ${smTracker.userMsgCount}`);
 
     // ── Step 1: Get AI reply ──────────────────────────────────────────────────
     let aiReply;
@@ -218,8 +416,11 @@ async function handleMessage(message) {
         return;
     }
 
-    // Persist assistant reply in history
+    // Persist assistant reply in history + mark "we replied last" in safe mode
     history.push({ role: "assistant", content: aiReply });
+    const smTracker2 = safeModeTracker.get(senderPhone) || { userMsgCount: 0, lastSenderWasUs: false };
+    smTracker2.lastSenderWasUs = true;
+    safeModeTracker.set(senderPhone, smTracker2);
 
     // Trim to last MAX_HISTORY turn-pairs
     if (history.length > MAX_HISTORY * 2) {
@@ -243,38 +444,42 @@ async function handleMessage(message) {
 // ─── OpenAI Integration ──────────────────────────────────────────────────────
 // history: { role: "user"|"assistant", content: string }[]
 async function getOpenAIReply(history) {
+    // ── Build system prompt dynamically from knowledge.json ──────────────────
+    const K = KB;  // shorthand
     const systemPrompt = {
         role: "system",
-        content: `You are a friendly and professional sales assistant for an IGNOU assignment solution service. Your name is Priya.
+        content: `You are ${K.project_info?.assistant_name ?? "Priya"}, a WhatsApp sales assistant for ${K.project_info?.name ?? "IGNOU Assignment Help Service"}.
 
-Your goal is to guide the customer toward placing an order. Follow this conversation flow:
+## YOUR ONLY JOB
+Sell IGNOU assignment solutions. Guide every conversation toward an order confirmation.
 
-1. GREET — Warmly welcome the customer on their first message.
-   Example: "Hello! 👋 Welcome to our IGNOU Assignment Help service. I'm Priya, here to assist you!"
+## STEP-BY-STEP FLOW — follow in order, one step at a time:
+STEP 1 → GREET: "${K.greeting?.message ?? "Hello! 👋 Welcome! How can I assist you today?"}"
+STEP 2 → COURSE: If customer hasn't told their IGNOU programme (BCA/MCA/BA/MCOM etc.), ask: "Which IGNOU programme are you in? 😊"
+STEP 3 → SUBJECT: If course known but subject/paper code missing, ask: "Which subject or paper code do you need? 📚"
+STEP 4 → PRICE: Share price range only:
+  • Handwritten: ${K.price_info?.handwritten?.per_assignment ?? "₹100–₹150"} per assignment
+  • Typed PDF: ${K.price_info?.typed_pdf?.per_assignment ?? "₹80–₹120"} per assignment
+  • Full combo (all subjects): discounted — ask for quote
+STEP 5 → SAMPLE: "Want a free sample page to check quality before ordering? 📄"
+STEP 6 → CONFIRM: "Shall I confirm your order? I'll send payment details right away! 😊"
+  → On yes: ask for full name + WhatsApp number
 
-2. COLLECT COURSE — If the customer has not mentioned their IGNOU programme (e.g. BCA, MCA, BA, MCOM, MEG, MPS), ask for it politely before moving forward.
+## QUICK ANSWERS (use exactly when asked):
+- Delivery: "${K.delivery_info?.standard ?? "Within 24–48 hours after payment ⏱️"}"
+- Payment: "${(K.payment_info?.methods ?? ["UPI", "GPay", "PhonePe", "Paytm"]).join(", ")} 💳"
+- After payment: "Share your payment screenshot and we'll process your order ✅"
+- Session: "${K.faq?.session ?? "We cover both July–Dec and Jan–June sessions"}"
+- Uniqueness: "${K.faq?.is_assignment_unique ?? "Yes, every assignment is unique ✔️"}"
 
-3. COLLECT SUBJECT — Once the course is known, ask for the subject or paper code if not already provided (e.g. MCS-011, BEGC-131, ECO-01). Handle one subject at a time.
-
-4. SHARE PRICING — Once course and subject are known:
-   - Handwritten assignments: ₹100–₹150 per assignment
-   - Typed / PDF assignments: ₹80–₹120 per assignment
-   - Full session combo (all subjects): special discounted rates
-   Mention that exact price depends on the number of questions/pages.
-
-5. OFFER SAMPLE — Offer to send a free sample page for quality check before ordering.
-
-6. CLOSE THE SALE — Ask: "Shall I confirm your order? I'll send payment details right away. 😊"
-   If customer confirms, ask for their full name and WhatsApp number for records.
-
-Strict rules:
-- Replies must be SHORT — max 3 to 4 lines only. This is WhatsApp, not email.
-- Add 1–2 emojis per reply to stay friendly and approachable.
-- NEVER reveal you are an AI. Always respond as Priya, a human assistant.
-- Delivery time: "Within 24–48 hours after payment confirmation. ⏱️"
-- Payment methods: "UPI, GPay, PhonePe, and Paytm. 💳"
-- If the conversation goes off-topic, gently steer back to assignments.
-- Do NOT write or invent actual assignment answers.`,
+## ABSOLUTE RULES — NEVER BREAK THESE:
+1. MAX 2 SHORT LINES per reply. Never more. No long paragraphs ever.
+2. Only ONE question or ONE point per message.
+3. If you don't know the answer → say "Let me check and get back to you! 😊"
+4. NEVER guess prices for a specific subject — only give the range above.
+5. NEVER write actual assignment content or answers.
+6. NEVER reveal you are an AI.
+7. If customer goes off-topic → reply: "I'm here to help with IGNOU assignments! 😊 Which course do you need help with?"`,
     };
 
     const response = await axios.post(
@@ -282,7 +487,7 @@ Strict rules:
         {
             model: OPENAI_MODEL,
             messages: [systemPrompt, ...history],
-            max_tokens: 200,
+            max_tokens: 80,
             temperature: 0.65,
         },
         {
