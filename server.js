@@ -469,7 +469,7 @@ app.use(express.json());
 // Must return HTTP 200 — plain text "Server running" is the standard response.
 app.get("/", (_req, res) => {
     log("info", "Health", "Health check ping received");
-    res.status(200).send("Server running");
+    res.status(200).type("text/plain").send("Server awake");
 });
 
 // ─── Webhook Endpoint ────────────────────────────────────────────────────────
@@ -496,9 +496,9 @@ app.get("/webhook", (req, res) => {
     const challenge = req.query.challenge || req.query["hub.challenge"];
     if (challenge) {
         log("info", "Webhook", "Verification challenge received and returned");
-        return res.status(200).send(challenge);
+        return res.status(200).type("text/plain").send(challenge);
     }
-    res.status(403).send("No challenge provided");
+    res.status(403).type("text/plain").send("No challenge provided");
 });
 
 app.post("/webhook", (req, res) => {
